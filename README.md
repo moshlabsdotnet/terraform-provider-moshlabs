@@ -155,57 +155,51 @@ they're pinned to — the full create/update/no-op/override lifecycle is additio
 
 ## Local development
 
-To iterate on the provider's Go code without waiting on a registry release, Terraform needs to be
-pointed at a locally built binary. There are two ways to do that, and which one you need depends on
-what you're running `terraform` against.
-
 `make test` runs the Go unit tests; `make build` just compiles; both work standalone, no Terraform CLI
-config needed. `go generate ./...`-style doc regeneration is
+config needed. Regenerate docs after any schema change with
 `go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@v0.25.0 generate --provider-name moshlabs`
-(run it after any schema change and commit the `docs/` diff — CI enforces this).
+and commit the `docs/` diff — CI enforces this.
 
-### Option A — `dev_overrides` (moshlabs-only configs)
+### Switching consuming configs between the local build and the published release
 
-Use this for a config that *only* uses the `moshlabs` provider, like
-[examples/data-sources/moshlabs_context](examples/data-sources/moshlabs_context) — nothing else needs
-installing. [`dev_overrides`](https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides-for-provider-developers)
-is the simplest option, but it makes `terraform init` fail for that provider (Terraform tries to resolve
-it against the real registry regardless) — so skip `init` entirely and go straight to `plan`/`apply`.
+The Makefile manages one CLI-config file — `.local.tfrc` (gitignored) — that both Terraform and
+OpenTofu read. Point them at it once:
 
 ```sh
-make dev-overrides   # go install's the provider, writes dev.terraformrc (gitignored — machine-specific path)
-TF_CLI_CONFIG_FILE=$(pwd)/dev.terraformrc terraform -chdir=examples/data-sources/moshlabs_context plan   # no init — see above
+export TF_CLI_CONFIG_FILE=/path/to/terraform-provider-moshlabs/.local.tfrc   # add to ~/.zshrc
 ```
 
-### Option B — filesystem mirror (any real config)
+Then flip modes from this repo, and it takes effect for `terraform`/`tofu` runs anywhere:
 
-Use this for anything that also has other providers to install — `aws`, `google`, `kubernetes`, etc. —
-i.e. any actual downstream module tree (PlatformInfrastructure, SutureHealth.Platform...). `dev_overrides`
-breaks `init` for the *whole* config, not just moshlabs, so it doesn't work here. A
-[filesystem mirror](https://developer.hashicorp.com/terraform/cli/config/config-file#filesystem_mirror)
-is honored by `init`'s normal installation logic instead of bypassing it, so `init` succeeds and
-everything else installs normally.
+| Command | Effect |
+|---|---|
+| `make local`  | `go install`s the provider and writes a `dev_overrides` config. `terraform init` still resolves the real release (for the lock file), but `plan`/`apply` transparently run your local build — with a "development overrides are in effect" banner so you can't forget. No consuming-repo lockfile edits needed. Re-run after each code change to reinstall. |
+| `make remote` | Writes a plain passthrough config. Consuming configs resolve `moshlabsdotnet/moshlabs` from the registry as normal. Leaving `TF_CLI_CONFIG_FILE` permanently set to `.local.tfrc` in this mode is identical to not setting it. |
+| `make status` | Shows `LOCAL` / `REMOTE` / `UNSET`, and warns if `TF_CLI_CONFIG_FILE` isn't pointing at the switch file. |
+
+`make local` skips `terraform init` for the moshlabs provider, so for a config that *also* has other
+providers to install you still `terraform init` once (in `remote` mode, or with the other providers
+already installed) before switching to `local` for the plan/apply loop.
+
+### `make mirror` — the offline / pre-release variant
+
+`make local` needs the release to exist on the registry (so `init` can resolve *something* to lock).
+When that's not true — fully offline, or testing an unreleased `MIRROR_VERSION` before tagging it —
+use `make mirror` instead: it stages the binary into a `filesystem_mirror` under `.mirror/` (gitignored)
+and writes that into the same `.local.tfrc`. `make remote` reverts it the same way.
 
 ```sh
-make mirror   # go install's the provider, stages .mirror/ (gitignored), writes mirror.terraformrc
+make mirror MIRROR_VERSION=0.2.0   # defaults to the latest git tag
 ```
 
-Then, from the directory you actually want to run Terraform in:
+**After a code change in mirror mode**, re-run `make mirror`, then in the consuming repo delete the
+stale `provider "registry.terraform.io/moshlabsdotnet/moshlabs" { ... }` block from its
+`.terraform.lock.hcl` (its checksum won't match the rebuilt binary) and re-run `terraform init` there.
+`dev_overrides` (`make local`) doesn't have this problem — it bypasses the lock file entirely.
 
-```sh
-TF_CLI_CONFIG_FILE=/path/to/terraform-provider-moshlabs/mirror.terraformrc terraform init
-TF_CLI_CONFIG_FILE=/path/to/terraform-provider-moshlabs/mirror.terraformrc terraform plan
-```
-
-**After changing the provider's Go code**, the binary staged in `.mirror/` is stale. Re-run `make mirror`
-to rebuild and restage it, then in the *consuming* repo's `.terraform.lock.hcl`, delete the
-`provider "registry.terraform.io/moshlabsdotnet/moshlabs" { ... }` block (its recorded checksum won't
-match the new binary and `init`/`init -upgrade` will refuse to proceed otherwise) and re-run `terraform
-init` there to regenerate it.
-
-**This reads real state and calls real provider APIs if you point it at a real environment.** `plan` is
-non-destructive on its own, but it isn't a toy — it needs real credentials to succeed and it does refresh
-real resources over the network. Never run `apply` this way against anything you don't intend to change.
+**Pointing any of this at a real environment reads real state and calls real provider APIs.** `plan` is
+non-destructive but not a toy — it needs real credentials and refreshes real resources. Never `apply`
+a local build against anything you don't intend to change.
 
 ## Releasing
 
@@ -226,3 +220,11 @@ registered under the `moshlabsdotnet` namespace on registry.terraform.io.
 
 - When to delete `modules/system-context` and `modules/system-resource` from `terraform-modules`: safe
   once no downstream consumer still sources them.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+This provider was scaffolded from HashiCorp's `terraform-provider-scaffolding-framework`
+(MPL-2.0) and relicensed to Apache-2.0. It links `terraform-plugin-framework` and related
+HashiCorp libraries, which remain under the Mozilla Public License 2.0.

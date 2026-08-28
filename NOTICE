@@ -1,0 +1,10 @@
+Terraform Provider for Mosh Labs
+Copyright 2026 Mosh Labs
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This provider is built with the HashiCorp terraform-plugin-framework and related
+libraries, which are distributed under the Mozilla Public License 2.0.

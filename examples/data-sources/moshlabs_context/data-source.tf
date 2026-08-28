@@ -1,3 +1,6 @@
+# Copyright 2026 Mosh Labs
+# SPDX-License-Identifier: Apache-2.0
+
 # Account scope — the top of the hierarchy.
 data "moshlabs_context" "account" {
   account = "acme"

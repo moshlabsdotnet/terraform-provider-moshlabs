@@ -1,3 +1,6 @@
+// Copyright 2026 Mosh Labs
+// SPDX-License-Identifier: Apache-2.0
+
 package provider
 
 import "testing"

@@ -1,3 +1,6 @@
+# Copyright 2026 Mosh Labs
+# SPDX-License-Identifier: Apache-2.0
+
 # A stand-in for an already-known value — in practice this is typically
 # another root module's real output (e.g. moshlabs-platform/iac/main.tf's
 # `output "platform"`), not a literal like this.

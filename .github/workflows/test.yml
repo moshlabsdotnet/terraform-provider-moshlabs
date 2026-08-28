@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - run: go build ./...
+      - run: go test ./... -v
+      - name: Check docs are up to date
+        run: |
+          go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs@v0.25.0 generate --provider-name moshlabs
+          git diff --exit-code -- docs/ || {
+            echo "::error::docs/ is out of date — run 'tfplugindocs generate --provider-name moshlabs' and commit the result"
+            exit 1
+          }

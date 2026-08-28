@@ -1,0 +1,13 @@
+/terraform-provider-moshlabs
+dev.terraformrc
+mirror.terraformrc
+/.mirror/
+/dist/
+
+# Terraform lock/state left behind by running the examples locally
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log

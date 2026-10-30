@@ -1,23 +1,30 @@
 # Copyright 2026 Mosh Labs
 # SPDX-License-Identifier: Apache-2.0
 
-# Account scope — the top of the hierarchy.
+# Platform scope — the top of the hierarchy.
+data "moshlabs_context" "platform" {
+  platform = "core"
+  metadata = {
+    organization  = "acme.com"
+    status        = "ACTIVE"
+    control_plane = "core"
+  }
+}
+
+# Account scope — receives the platform's resolved context via `init`
+# instead of re-deriving it.
 data "moshlabs_context" "account" {
+  init    = data.moshlabs_context.platform
   account = "acme"
   metadata = {
     ecosystem = "production"
-    platform  = "core"
     cloud     = "gcp"
   }
 }
 
-# Environment scope — receives the account's resolved context via `init`
-# instead of re-deriving it.
+# Environment scope — receives the account's resolved context via `init`.
 data "moshlabs_context" "environment" {
-  init = {
-    account  = data.moshlabs_context.account.account
-    metadata = data.moshlabs_context.account.metadata
-  }
+  init        = data.moshlabs_context.account
   environment = "prod"
   metadata = {
     region = "us-east1"
@@ -26,11 +33,7 @@ data "moshlabs_context" "environment" {
 
 # Service scope — receives the environment's resolved context via `init`.
 data "moshlabs_context" "service" {
-  init = {
-    account     = data.moshlabs_context.environment.account
-    environment = data.moshlabs_context.environment.environment
-    metadata    = data.moshlabs_context.environment.metadata
-  }
+  init    = data.moshlabs_context.environment
   service = "api"
   metadata = {
     version = "1.2.3"

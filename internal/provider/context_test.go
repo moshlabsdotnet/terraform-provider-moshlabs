@@ -9,61 +9,24 @@ import (
 	"testing"
 )
 
-func strptr(s string) *string { return &s }
-
 // ---------------------------------------------------------------------
-// coalesceString / coalesceStringPtr
+// helpers
 // ---------------------------------------------------------------------
 
-func TestCoalesceStringPtr(t *testing.T) {
-	tests := []struct {
-		name string
-		vals []*string
-		want *string
-	}{
-		{"no args", nil, nil},
-		{"single nil", []*string{nil}, nil},
-		{"all nil", []*string{nil, nil, nil}, nil},
-		{"single value", []*string{strptr("a")}, strptr("a")},
-		{"first wins", []*string{strptr("a"), strptr("b")}, strptr("a")},
-		{"skips leading nil", []*string{nil, strptr("b")}, strptr("b")},
-		{"skips leading empty string", []*string{strptr(""), strptr("b")}, strptr("b")},
-		{"empty string is not a value", []*string{strptr("")}, nil},
-		{"all empty strings", []*string{strptr(""), strptr("")}, nil},
-		{"nil then empty then value", []*string{nil, strptr(""), strptr("c")}, strptr("c")},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := coalesceStringPtr(tt.vals...)
-			if (got == nil) != (tt.want == nil) {
-				t.Fatalf("coalesceStringPtr(%v) = %v, want %v", derefAll(tt.vals), derefPtr(got), derefPtr(tt.want))
-			}
-			if got != nil && *got != *tt.want {
-				t.Fatalf("coalesceStringPtr(%v) = %q, want %q", derefAll(tt.vals), *got, *tt.want)
-			}
-		})
-	}
-}
+// md builds a metadata map from alternating key/value pairs; a value of
+// nullv yields an explicit null element.
+const nullv = "\x00null"
 
-func TestCoalesceString(t *testing.T) {
-	tests := []struct {
-		name string
-		vals []*string
-		want string
-	}{
-		{"no args", nil, ""},
-		{"all nil", []*string{nil, nil}, ""},
-		{"all empty", []*string{strptr(""), strptr("")}, ""},
-		{"single value", []*string{strptr("acme")}, "acme"},
-		{"first non-empty wins", []*string{strptr(""), strptr("acme")}, "acme"},
+func md(kv ...string) map[string]*string {
+	out := map[string]*string{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		if kv[i+1] == nullv {
+			out[kv[i]] = nil
+		} else {
+			out[kv[i]] = strptr(kv[i+1])
+		}
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := coalesceString(tt.vals...); got != tt.want {
-				t.Fatalf("coalesceString(%v) = %q, want %q", derefAll(tt.vals), got, tt.want)
-			}
-		})
-	}
+	return out
 }
 
 func derefPtr(p *string) string {
@@ -73,733 +36,416 @@ func derefPtr(p *string) string {
 	return *p
 }
 
-func derefAll(vals []*string) []string {
-	out := make([]string, len(vals))
-	for i, v := range vals {
-		out[i] = derefPtr(v)
+func derefMap(m map[string]*string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = derefPtr(v)
 	}
 	return out
 }
 
+func samePtr(a, b *string) bool {
+	return (a == nil && b == nil) || (a != nil && b != nil && *a == *b)
+}
+
+func platformMetadata() map[string]*string {
+	return md("organization", "o", "status", "ACTIVE", "control_plane", "c")
+}
+
 // ---------------------------------------------------------------------
-// mergeStringMaps
+// coalesceStringPtr
 // ---------------------------------------------------------------------
 
-func TestMergeStringMaps(t *testing.T) {
+func TestCoalesceStringPtr(t *testing.T) {
 	tests := []struct {
 		name string
-		in   []map[string]string
+		vals []*string
+		want *string
+	}{
+		{"no args", nil, nil},
+		{"all nil", []*string{nil, nil, nil}, nil},
+		{"first wins", []*string{strptr("a"), strptr("b")}, strptr("a")},
+		{"skips leading nil", []*string{nil, strptr("b")}, strptr("b")},
+		{"skips leading empty string", []*string{strptr(""), strptr("b")}, strptr("b")},
+		{"empty string is not a value", []*string{strptr("")}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := coalesceStringPtr(tt.vals...); !samePtr(got, tt.want) {
+				t.Fatalf("coalesceStringPtr = %s, want %s", derefPtr(got), derefPtr(tt.want))
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------
+// mergeMetadata / filterKeys / coerceMetadata / normalizeLabels
+// ---------------------------------------------------------------------
+
+func TestMergeMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []map[string]*string
 		want map[string]string
 	}{
 		{"no maps", nil, map[string]string{}},
-		{"single nil map", []map[string]string{nil}, map[string]string{}},
-		{"single empty map", []map[string]string{{}}, map[string]string{}},
-		{
-			"single populated map",
-			[]map[string]string{{"a": "1"}},
-			map[string]string{"a": "1"},
-		},
-		{
-			"disjoint keys combine",
-			[]map[string]string{{"a": "1"}, {"b": "2"}},
-			map[string]string{"a": "1", "b": "2"},
-		},
-		{
-			"later map overrides earlier on collision",
-			[]map[string]string{{"a": "1"}, {"a": "2"}},
-			map[string]string{"a": "2"},
-		},
-		{
-			"nil maps interleaved with populated ones are skipped",
-			[]map[string]string{{"a": "1"}, nil, {"b": "2"}},
-			map[string]string{"a": "1", "b": "2"},
-		},
-		{
-			"three-way override chain, last write wins",
-			[]map[string]string{{"a": "1"}, {"a": "2"}, {"a": "3"}},
-			map[string]string{"a": "3"},
-		},
+		{"nil maps are skipped", []map[string]*string{md("a", "1"), nil, md("b", "2")}, map[string]string{"a": "1", "b": "2"}},
+		{"later map overrides earlier", []map[string]*string{md("a", "1"), md("a", "2")}, map[string]string{"a": "2"}},
+		{"explicit null overrides a value", []map[string]*string{md("a", "1"), md("a", nullv)}, map[string]string{"a": "<nil>"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := mergeStringMaps(tt.in...)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("mergeStringMaps(%v) = %#v, want %#v", tt.in, got, tt.want)
+			if got := derefMap(mergeMetadata(tt.in...)); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("mergeMetadata = %#v, want %#v", got, tt.want)
 			}
 		})
 	}
 }
-
-// ---------------------------------------------------------------------
-// filterKeys
-// ---------------------------------------------------------------------
 
 func TestFilterKeys(t *testing.T) {
-	tests := []struct {
-		name    string
-		m       map[string]string
-		allowed []string
-		want    map[string]string
-	}{
-		{"nil map, no allowed", nil, nil, map[string]string{}},
-		{"empty map", map[string]string{}, []string{"a"}, map[string]string{}},
-		{"no allowed keys drops everything", map[string]string{"a": "1"}, nil, map[string]string{}},
-		{
-			"only allowed keys pass",
-			map[string]string{"a": "1", "b": "2", "c": "3"},
-			[]string{"a", "c"},
-			map[string]string{"a": "1", "c": "3"},
-		},
-		{
-			"allowed key absent from map is simply not present in output",
-			map[string]string{"a": "1"},
-			[]string{"a", "z"},
-			map[string]string{"a": "1"},
-		},
-		{
-			"matching is case-sensitive and exact",
-			map[string]string{"Scope": "account", "scope": "account"},
-			[]string{"scope"},
-			map[string]string{"scope": "account"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := filterKeys(tt.m, tt.allowed...)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("filterKeys(%#v, %v) = %#v, want %#v", tt.m, tt.allowed, got, tt.want)
-			}
-		})
+	got := derefMap(filterKeys(md("a", "1", "b", nullv, "c", "3", "Scope", "x"), "b", "c", "scope"))
+	want := map[string]string{"b": "<nil>", "c": "3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("filterKeys = %#v, want %#v", got, want)
 	}
 }
 
-// ---------------------------------------------------------------------
-// normalizeLabels
-// ---------------------------------------------------------------------
+func TestCoerceMetadata(t *testing.T) {
+	attrs := []metadataAttr{{Name: "req", Required: true}, {Name: "opt"}}
+
+	got, err := coerceMetadata("x", md("req", "1", "extra", "dropped"), attrs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := map[string]string{"req": "1", "opt": "<nil>"}; !reflect.DeepEqual(derefMap(got), want) {
+		t.Fatalf("coerceMetadata = %#v, want %#v (unlisted dropped, unset optional present as null)", derefMap(got), want)
+	}
+
+	if _, err := coerceMetadata("x", md("req", nullv), attrs); err != nil {
+		t.Fatalf("present-but-null required attribute must pass, got %v", err)
+	}
+
+	if _, err := coerceMetadata("x", md("opt", "1"), attrs); err == nil || !strings.Contains(err.Error(), `"req"`) {
+		t.Fatalf("missing required attribute must error naming it, got %v", err)
+	}
+}
 
 func TestNormalizeLabels(t *testing.T) {
+	got := normalizeLabels(md(
+		"environment_id", "42",
+		"Platform", "Some.Dotted_Value",
+		"a.b", "x_y",
+		"dropped", nullv,
+		"empty", "",
+	))
+	want := map[string]string{
+		"environment-id": "42",
+		"platform":       "some-dotted_value",
+		"a.b":            "x_y",
+		"empty":          "",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeLabels = %#v, want %#v", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------
+// computeContext — parity with modules/system-context
+//
+// Every expectation below was captured by running the HCL module itself
+// (terraform apply of a root calling modules/system-context with the same
+// inputs) — results are copied from `terraform output -json` verbatim.
+// ---------------------------------------------------------------------
+
+type wantContext struct {
+	scope       string
+	platform    *string
+	account     *string
+	environment *string
+	service     *string
+	metadata    map[string]string // "<nil>" = explicit null
+	labels      map[string]string
+}
+
+func checkContext(t *testing.T, got contextResult, want wantContext) {
+	t.Helper()
+	if got.Scope != want.scope {
+		t.Errorf("Scope = %q, want %q", got.Scope, want.scope)
+	}
+	for _, f := range []struct {
+		name      string
+		got, want *string
+	}{
+		{"Platform", got.Platform, want.platform},
+		{"Account", got.Account, want.account},
+		{"Environment", got.Environment, want.environment},
+		{"Service", got.Service, want.service},
+	} {
+		if !samePtr(f.got, f.want) {
+			t.Errorf("%s = %s, want %s", f.name, derefPtr(f.got), derefPtr(f.want))
+		}
+	}
+	if m := derefMap(got.Metadata); !reflect.DeepEqual(m, want.metadata) {
+		t.Errorf("Metadata = %#v\n want %#v", m, want.metadata)
+	}
+	if !reflect.DeepEqual(got.Labels, want.labels) {
+		t.Errorf("Labels = %#v\n want %#v", got.Labels, want.labels)
+	}
+}
+
+// resultInit converts a resolved context into the init of the next call,
+// the way `init = module.<parent>` does in HCL.
+func resultInit(r contextResult) contextInit {
+	return contextInit{
+		Platform:    r.Platform,
+		Account:     r.Account,
+		Environment: r.Environment,
+		Service:     r.Service,
+		Metadata:    r.Metadata,
+	}
+}
+
+func mustContext(t *testing.T, in contextInput) contextResult {
+	t.Helper()
+	got, err := computeContext(in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return got
+}
+
+func TestComputeContext_Cascade(t *testing.T) {
+	platform := mustContext(t, contextInput{
+		Platform: strptr("Acme_Plat"),
+		Metadata: md("organization", "Acme.com", "status", "ACTIVE", "control_plane", "core", "extra", "x", "ecosystem", "production"),
+	})
+	checkContext(t, platform, wantContext{
+		scope:    "platform",
+		platform: strptr("Acme_Plat"),
+		metadata: map[string]string{"control_plane": "core", "organization": "Acme.com", "platform": "Acme_Plat", "scope": "platform", "status": "ACTIVE"},
+		labels:   map[string]string{"platform": "acme_plat", "scope": "platform", "terraform": "true"},
+	})
+
+	account := mustContext(t, contextInput{
+		Init:     resultInit(platform),
+		Account:  strptr("Acct.One"),
+		Metadata: md("ecosystem", "development", "cloud", "gcp", "platform", "ignored"),
+	})
+	checkContext(t, account, wantContext{
+		scope:    "account",
+		platform: strptr("Acme_Plat"),
+		account:  strptr("Acct.One"),
+		metadata: map[string]string{"cloud": "gcp", "control_plane": "core", "ecosystem": "development", "organization": "Acme.com", "platform": "Acme_Plat", "region": "<nil>", "scope": "account", "status": "ACTIVE"},
+		labels:   map[string]string{"account": "acct-one", "ecosystem": "development", "platform": "acme_plat", "scope": "account", "terraform": "true"},
+	})
+
+	environment := mustContext(t, contextInput{
+		Init:        resultInit(account),
+		Environment: strptr("dev"),
+		Metadata:    md("region", "us-east1", "version", "9"),
+	})
+	checkContext(t, environment, wantContext{
+		scope:       "environment",
+		platform:    strptr("Acme_Plat"),
+		account:     strptr("Acct.One"),
+		environment: strptr("dev"),
+		metadata:    map[string]string{"cloud": "gcp", "control_plane": "core", "ecosystem": "development", "organization": "Acme.com", "platform": "Acme_Plat", "region": "us-east1", "scope": "environment", "status": "ACTIVE"},
+		labels:      map[string]string{"account": "acct-one", "ecosystem": "development", "environment": "dev", "platform": "acme_plat", "scope": "environment", "terraform": "true"},
+	})
+
+	// nested/num/flag stand in for system-service passing its whole
+	// var.config; scalarsFromDynamic has already dropped the nested value
+	// and stringified the scalars by the time computeContext sees them.
+	service := mustContext(t, contextInput{
+		Init:     resultInit(environment),
+		Service:  strptr("api_svc"),
+		Metadata: md("version", "1.2.3", "num", "3", "flag", "true"),
+	})
+	checkContext(t, service, wantContext{
+		scope:       "service",
+		platform:    strptr("Acme_Plat"),
+		account:     strptr("Acct.One"),
+		environment: strptr("dev"),
+		service:     strptr("api_svc"),
+		metadata:    map[string]string{"cloud": "gcp", "control_plane": "core", "ecosystem": "development", "organization": "Acme.com", "platform": "Acme_Plat", "region": "us-east1", "scope": "service", "status": "ACTIVE", "version": "1.2.3"},
+		labels:      map[string]string{"account": "acct-one", "ecosystem": "development", "env": "dev", "environment": "dev", "platform": "acme_plat", "scope": "service", "service": "api_svc", "terraform": "true"},
+	})
+}
+
+func TestComputeContext_Parity(t *testing.T) {
 	tests := []struct {
 		name string
-		in   map[string]string
-		want map[string]string
+		in   contextInput
+		want wantContext
 	}{
-		{"nil map", nil, map[string]string{}},
-		{"empty map", map[string]string{}, map[string]string{}},
 		{
-			"underscore in key becomes dash",
-			map[string]string{"environment_id": "42"},
-			map[string]string{"environment-id": "42"},
+			name: "account scope, unset optionals present as null",
+			in: contextInput{
+				Init:     contextInit{Platform: strptr("Acme_Plat"), Metadata: md("organization", "Acme.com", "status", "ACTIVE", "control_plane", "core")},
+				Account:  strptr("a2"),
+				Metadata: md("ecosystem", "production"),
+			},
+			want: wantContext{
+				scope:    "account",
+				platform: strptr("Acme_Plat"),
+				account:  strptr("a2"),
+				metadata: map[string]string{"cloud": "<nil>", "control_plane": "core", "ecosystem": "production", "organization": "Acme.com", "platform": "Acme_Plat", "region": "<nil>", "scope": "account", "status": "ACTIVE"},
+				labels:   map[string]string{"account": "a2", "ecosystem": "production", "platform": "acme_plat", "scope": "account", "terraform": "true"},
+			},
 		},
 		{
-			"dot in value becomes dash",
-			map[string]string{"platform": "some.dotted.value"},
-			map[string]string{"platform": "some-dotted-value"},
+			name: "service scope set directly in one call",
+			in: contextInput{
+				Platform:    strptr("p"),
+				Account:     strptr("a"),
+				Environment: strptr("e"),
+				Service:     strptr("s"),
+				Metadata:    mergeMetadata(platformMetadata(), md("ecosystem", "production", "region", "r")),
+			},
+			want: wantContext{
+				scope:       "service",
+				platform:    strptr("p"),
+				account:     strptr("a"),
+				environment: strptr("e"),
+				service:     strptr("s"),
+				metadata:    map[string]string{"cloud": "<nil>", "control_plane": "c", "ecosystem": "production", "organization": "o", "platform": "p", "region": "r", "scope": "service", "status": "ACTIVE", "version": "<nil>"},
+				labels:      map[string]string{"account": "a", "ecosystem": "production", "env": "e", "environment": "e", "platform": "p", "scope": "service", "service": "s", "terraform": "true"},
+			},
 		},
 		{
-			"multiple underscores and dots",
-			map[string]string{"a_b_c": "x.y.z"},
-			map[string]string{"a-b-c": "x-y-z"},
+			name: "null required attribute via init is accepted",
+			in: fromInit(contextInit{
+				Platform: strptr("p"),
+				Metadata: md("organization", "o", "status", "ACTIVE", "control_plane", nullv),
+			}),
+			want: wantContext{
+				scope:    "platform",
+				platform: strptr("p"),
+				metadata: map[string]string{"control_plane": "<nil>", "organization": "o", "platform": "p", "scope": "platform", "status": "ACTIVE"},
+				labels:   map[string]string{"platform": "p", "scope": "platform", "terraform": "true"},
+			},
 		},
 		{
-			"keys and values are lowercased",
-			map[string]string{"Account": "ACME"},
-			map[string]string{"account": "acme"},
+			name: "empty platform passes validation but resolves to null",
+			in:   contextInput{Platform: strptr(""), Metadata: platformMetadata()},
+			want: wantContext{
+				scope:    "platform",
+				metadata: map[string]string{"control_plane": "c", "organization": "o", "platform": "<nil>", "scope": "platform", "status": "ACTIVE"},
+				labels:   map[string]string{"scope": "platform", "terraform": "true"},
+			},
 		},
 		{
-			"empty value is dropped entirely",
-			map[string]string{"account": "", "service": "api"},
-			map[string]string{"service": "api"},
+			name: "empty required attribute is still a value",
+			in:   contextInput{Platform: strptr("p"), Metadata: md("organization", "", "status", "ACTIVE", "control_plane", "c")},
+			want: wantContext{
+				scope:    "platform",
+				platform: strptr("p"),
+				metadata: map[string]string{"control_plane": "c", "organization": "", "platform": "p", "scope": "platform", "status": "ACTIVE"},
+				labels:   map[string]string{"platform": "p", "scope": "platform", "terraform": "true"},
+			},
 		},
 		{
-			"all empty values yields empty map, not nil",
-			map[string]string{"account": ""},
-			map[string]string{},
+			name: "empty account resolves to platform scope",
+			in:   contextInput{Platform: strptr("p"), Account: strptr(""), Metadata: platformMetadata()},
+			want: wantContext{
+				scope:    "platform",
+				platform: strptr("p"),
+				metadata: map[string]string{"control_plane": "c", "organization": "o", "platform": "p", "scope": "platform", "status": "ACTIVE"},
+				labels:   map[string]string{"platform": "p", "scope": "platform", "terraform": "true"},
+			},
 		},
 		{
-			"key with dot and value with underscore are untouched by the other's rule",
-			map[string]string{"a.b": "x_y"},
-			map[string]string{"a.b": "x_y"},
+			name: "empty metadata value is kept",
+			in:   contextInput{Platform: strptr("p"), Account: strptr("a"), Metadata: mergeMetadata(platformMetadata(), md("ecosystem", "production", "region", ""))},
+			want: wantContext{
+				scope:    "account",
+				platform: strptr("p"),
+				account:  strptr("a"),
+				metadata: map[string]string{"cloud": "<nil>", "control_plane": "c", "ecosystem": "production", "organization": "o", "platform": "p", "region": "", "scope": "account", "status": "ACTIVE"},
+				labels:   map[string]string{"account": "a", "ecosystem": "production", "platform": "p", "scope": "account", "terraform": "true"},
+			},
+		},
+		{
+			name: "direct values override init",
+			in: contextInput{
+				Init: contextInit{
+					Platform:    strptr("ip"),
+					Account:     strptr("ia"),
+					Environment: strptr("ie"),
+					Metadata:    mergeMetadata(platformMetadata(), md("ecosystem", "production", "region", "ir")),
+				},
+				Environment: strptr("de"),
+				Metadata:    md("region", "dr"),
+			},
+			want: wantContext{
+				scope:       "environment",
+				platform:    strptr("ip"),
+				account:     strptr("ia"),
+				environment: strptr("de"),
+				metadata:    map[string]string{"cloud": "<nil>", "control_plane": "c", "ecosystem": "production", "organization": "o", "platform": "ip", "region": "dr", "scope": "environment", "status": "ACTIVE"},
+				labels:      map[string]string{"account": "ia", "ecosystem": "production", "environment": "de", "platform": "ip", "scope": "environment", "terraform": "true"},
+			},
+		},
+		{
+			name: "explicit null metadata overrides init",
+			in: contextInput{
+				Init:     contextInit{Platform: strptr("p"), Account: strptr("a"), Metadata: mergeMetadata(platformMetadata(), md("ecosystem", "production", "region", "ir"))},
+				Metadata: md("region", nullv),
+			},
+			want: wantContext{
+				scope:    "account",
+				platform: strptr("p"),
+				account:  strptr("a"),
+				metadata: map[string]string{"cloud": "<nil>", "control_plane": "c", "ecosystem": "production", "organization": "o", "platform": "p", "region": "<nil>", "scope": "account", "status": "ACTIVE"},
+				labels:   map[string]string{"account": "a", "ecosystem": "production", "platform": "p", "scope": "account", "terraform": "true"},
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeLabels(tt.in)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("normalizeLabels(%#v) = %#v, want %#v", tt.in, got, tt.want)
-			}
+			checkContext(t, mustContext(t, tt.in), tt.want)
 		})
 	}
 }
 
-// ---------------------------------------------------------------------
-// computeContext — account scope
-// ---------------------------------------------------------------------
+// fromInit builds an input whose metadata arrives only via init — the only
+// way an explicit null reaches computeContext from real config.
+func fromInit(init contextInit) contextInput { return contextInput{Init: init} }
 
-func TestComputeContext_AccountScope(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Account: strptr("acme"),
-		Metadata: map[string]string{
-			"ecosystem": "production",
-			"platform":  "core",
-			"cloud":     "gcp",
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if got.Scope != "account" {
-		t.Fatalf("Scope = %q, want %q", got.Scope, "account")
-	}
-	if got.Account != "acme" {
-		t.Fatalf("Account = %q, want %q", got.Account, "acme")
-	}
-	if got.Environment != nil || got.Service != nil {
-		t.Fatalf("Environment/Service should be nil at account scope, got %v/%v", got.Environment, got.Service)
-	}
-	if got.Metadata["scope"] != "account" {
-		t.Fatalf("Metadata[scope] = %q, want %q", got.Metadata["scope"], "account")
-	}
-	if got.Metadata["cloud"] != "gcp" {
-		t.Fatalf("Metadata[cloud] = %q, want %q (metadata not scoped should pass through unfiltered)", got.Metadata["cloud"], "gcp")
-	}
-
-	wantLabels := map[string]string{
-		"account":   "acme",
-		"scope":     "account",
-		"platform":  "core",
-		"ecosystem": "production",
-		"terraform": "true",
-	}
-	if !reflect.DeepEqual(got.Labels, wantLabels) {
-		t.Fatalf("Labels = %#v, want %#v (cloud must NOT leak into labels — only scope/platform/ecosystem are allowed at account scope)", got.Labels, wantLabels)
-	}
-	if _, ok := got.Labels["cloud"]; ok {
-		t.Fatalf("cloud must not leak into labels at account scope: %#v", got.Labels)
-	}
-}
-
-// baseMetadata is the minimal metadata every success-path test needs now
-// that ecosystem/platform are required at account scope (modules/account
-// has no `optional(...)` on either) — tests that aren't specifically
-// exercising that requirement use this so the requirement itself doesn't
-// need repeating everywhere.
-func baseMetadata() map[string]string {
-	return map[string]string{"ecosystem": "production", "platform": "core"}
-}
-
-func TestComputeContext_AccountScope_EmptyAccountDropsLabel(t *testing.T) {
-	// Account unset entirely (nil, and no init) resolves to "" per coalesceString,
-	// and normalizeLabels drops empty-valued entries — so "account" is absent
-	// from Labels even though it's present (as "") in the Account field.
-	got, err := computeContext(contextInput{Metadata: baseMetadata()})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Scope != "account" {
-		t.Fatalf("Scope = %q, want %q", got.Scope, "account")
-	}
-	if got.Account != "" {
-		t.Fatalf("Account = %q, want empty string", got.Account)
-	}
-	if _, ok := got.Labels["account"]; ok {
-		t.Fatalf("account label should be dropped when account is empty, got %#v", got.Labels)
-	}
-	wantLabels := map[string]string{"scope": "account", "terraform": "true", "ecosystem": "production", "platform": "core"}
-	if !reflect.DeepEqual(got.Labels, wantLabels) {
-		t.Fatalf("Labels = %#v, want %#v", got.Labels, wantLabels)
-	}
-}
-
-func TestComputeContext_AccountScope_NilMetadataErrorsCleanly(t *testing.T) {
-	// Nil metadata (no ecosystem/platform available from anywhere) must
-	// produce a clean error, not a panic and not a silently-empty result.
-	got, err := computeContext(contextInput{
-		Account:  strptr("acme"),
-		Metadata: nil,
-		Init:     contextInit{Metadata: nil},
-	})
-	if err == nil {
-		t.Fatalf("expected an error (ecosystem/platform required), got result %#v", got)
-	}
-}
-
-func TestComputeContext_AccountScope_UserSuppliedScopeKeyIsOverridden(t *testing.T) {
-	// The literal "scope" computed by computeContext must win over any
-	// user-supplied metadata["scope"], since it's merged in last.
-	got, err := computeContext(contextInput{
-		Account:  strptr("acme"),
-		Metadata: mergeStringMaps(baseMetadata(), map[string]string{"scope": "bogus"}),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Metadata["scope"] != "account" {
-		t.Fatalf("Metadata[scope] = %q, want %q (computed scope must override user-supplied value)", got.Metadata["scope"], "account")
-	}
-	if got.Labels["scope"] != "account" {
-		t.Fatalf("Labels[scope] = %q, want %q", got.Labels["scope"], "account")
-	}
-}
-
-func TestComputeContext_AccountScope_MetadataPreservesCasingAndDots(t *testing.T) {
-	// Only Labels go through normalizeLabels; Metadata is untouched.
-	got, err := computeContext(contextInput{
-		Account:  strptr("acme"),
-		Metadata: mergeStringMaps(baseMetadata(), map[string]string{"platform": "Some.Dotted.Value"}),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Metadata["platform"] != "Some.Dotted.Value" {
-		t.Fatalf("Metadata[platform] = %q, want unmodified %q", got.Metadata["platform"], "Some.Dotted.Value")
-	}
-}
-
-func TestComputeContext_AccountScope_EmptyAccountPointerTreatedAsUnset(t *testing.T) {
-	// A non-nil pointer to "" must behave identically to a nil pointer,
-	// mirroring HCL coalesce()'s empty-string skipping.
-	got, err := computeContext(contextInput{
-		Account:  strptr(""),
-		Init:     contextInit{Account: strptr("from-init")},
-		Metadata: baseMetadata(),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Account != "from-init" {
-		t.Fatalf("Account = %q, want %q (empty direct value should fall through to init)", got.Account, "from-init")
-	}
-}
-
-// ---------------------------------------------------------------------
-// computeContext — per-scope metadata allowlist and required fields
-// ---------------------------------------------------------------------
-
-func TestComputeContext_AccountMetadata_EcosystemRequired(t *testing.T) {
-	_, err := computeContext(contextInput{
-		Account:  strptr("acme"),
-		Metadata: map[string]string{"platform": "core"},
-	})
-	if err == nil {
-		t.Fatal("expected an error when ecosystem is missing")
-	}
-	if !strings.Contains(err.Error(), "ecosystem") {
-		t.Fatalf("error %q should mention ecosystem", err.Error())
-	}
-}
-
-func TestComputeContext_AccountMetadata_PlatformRequired(t *testing.T) {
-	_, err := computeContext(contextInput{
-		Account:  strptr("acme"),
-		Metadata: map[string]string{"ecosystem": "production"},
-	})
-	if err == nil {
-		t.Fatal("expected an error when platform is missing")
-	}
-	if !strings.Contains(err.Error(), "platform") {
-		t.Fatalf("error %q should mention platform", err.Error())
-	}
-}
-
-func TestComputeContext_AccountMetadata_EcosystemMustBeValidEnumValue(t *testing.T) {
-	_, err := computeContext(contextInput{
-		Account:  strptr("acme"),
-		Metadata: map[string]string{"ecosystem": "staging", "platform": "core"},
-	})
-	if err == nil {
-		t.Fatal(`expected an error for ecosystem "staging"`)
-	}
-	if !strings.Contains(err.Error(), "staging") {
-		t.Fatalf("error %q should name the invalid value", err.Error())
-	}
-}
-
-func TestComputeContext_AccountMetadata_UnknownKeysDroppedFromMetadataNotJustLabels(t *testing.T) {
-	// Mirrors system-service passing its whole var.config as metadata: keys
-	// outside the scope's allowlist (e.g. "replicas", "release_timeout")
-	// must not survive into context.metadata at all, not just be excluded
-	// from labels.
-	got, err := computeContext(contextInput{
-		Account: strptr("acme"),
-		Metadata: mergeStringMaps(baseMetadata(), map[string]string{
-			"replicas":        "1",
-			"release_timeout": "300",
-		}),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, ok := got.Metadata["replicas"]; ok {
-		t.Fatalf("Metadata = %#v, want \"replicas\" dropped (not in account's metadata allowlist)", got.Metadata)
-	}
-	if _, ok := got.Metadata["release_timeout"]; ok {
-		t.Fatalf("Metadata = %#v, want \"release_timeout\" dropped", got.Metadata)
-	}
-}
-
-func TestComputeContext_EnvironmentMetadata_OnlyRegionCanBeIntroducedDirectly(t *testing.T) {
-	// version is only in serviceMetadataKeys, not environmentMetadataKeys —
-	// passed directly at environment scope it must be dropped, exactly like
-	// account-scope keys (ecosystem/platform/cloud) can't be re-set here
-	// either (they just carry forward from account via the merge cascade).
-	got, err := computeContext(contextInput{
-		Init:        contextInit{Account: strptr("acme"), Metadata: baseMetadata()},
-		Environment: strptr("prod"),
-		Metadata:    map[string]string{"version": "9.9.9", "region": "us-east1"},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, ok := got.Metadata["version"]; ok {
-		t.Fatalf("Metadata = %#v, want \"version\" dropped at environment scope", got.Metadata)
-	}
-	if got.Metadata["region"] != "us-east1" {
-		t.Fatalf("Metadata[region] = %q, want %q", got.Metadata["region"], "us-east1")
-	}
-}
-
-// ---------------------------------------------------------------------
-// computeContext — environment scope
-// ---------------------------------------------------------------------
-
-func TestComputeContext_EnvironmentScope_InheritsAccountLabels(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Init: contextInit{
-			Account: strptr("acme"),
-			Metadata: map[string]string{
-				"ecosystem": "production",
-				"platform":  "core",
-			},
-		},
-		Environment: strptr("prod"),
-		Metadata: map[string]string{
-			"environment_id": "42",
-			"region":         "us-east1",
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if got.Scope != "environment" {
-		t.Fatalf("Scope = %q, want %q", got.Scope, "environment")
-	}
-	if got.Account != "acme" || got.Environment == nil || *got.Environment != "prod" {
-		t.Fatalf("Account/Environment = %q/%v, want acme/prod", got.Account, got.Environment)
-	}
-	if got.Service != nil {
-		t.Fatalf("Service should be nil at environment scope, got %v", got.Service)
-	}
-
-	// platform/ecosystem must survive from the account-level label cascade
-	// even though "environment" scope's own metadata filter doesn't list them.
-	// environment_id is absent here on purpose: environmentMetadataKeys only
-	// allows "region", so environment_id never reaches environmentMetadata in
-	// the first place — matching the original HCL module's behavior exactly
-	// (verified empirically against modules/system-context; its label filter
-	// lists "environment_id" too, but that's dead code there for the same
-	// reason).
-	wantLabels := map[string]string{
-		"account":     "acme",
-		"environment": "prod",
-		"scope":       "environment",
-		"platform":    "core",
-		"ecosystem":   "production",
-		"terraform":   "true",
-	}
-	if !reflect.DeepEqual(got.Labels, wantLabels) {
-		t.Fatalf("Labels = %#v, want %#v", got.Labels, wantLabels)
-	}
-	if _, ok := got.Labels["region"]; ok {
-		t.Fatalf("region must not leak into labels at environment scope: %#v", got.Labels)
-	}
-	if _, ok := got.Labels["environment-id"]; ok {
-		t.Fatalf("environment_id must not survive into labels (dropped upstream at the metadata-allowlist step): %#v", got.Labels)
-	}
-}
-
-func TestComputeContext_EnvironmentScope_DirectMetadataOverridesInitMetadata(t *testing.T) {
-	// region is the one key environment scope can actually introduce/override
-	// directly (environment_id can't — see InheritsAccountLabels above).
-	got, err := computeContext(contextInput{
-		Init: contextInit{
-			Account:  strptr("acme"),
-			Metadata: mergeStringMaps(baseMetadata(), map[string]string{"region": "from-init"}),
-		},
-		Environment: strptr("prod"),
-		Metadata:    map[string]string{"region": "from-direct"},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Metadata["region"] != "from-direct" {
-		t.Fatalf("Metadata[region] = %q, want direct metadata to win over init metadata", got.Metadata["region"])
-	}
-}
-
-func TestComputeContext_EnvironmentScope_UserSuppliedScopeKeyIsOverridden(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Init:        contextInit{Account: strptr("acme"), Metadata: baseMetadata()},
-		Environment: strptr("prod"),
-		Metadata:    map[string]string{"scope": "bogus"},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Metadata["scope"] != "environment" {
-		t.Fatalf("Metadata[scope] = %q, want %q", got.Metadata["scope"], "environment")
-	}
-}
-
-func TestComputeContext_EnvironmentScope_EmptyAccountPointerTreatedAsUnset(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Account:     strptr(""),
-		Environment: strptr("prod"),
-		Metadata:    baseMetadata(),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Account != "" {
-		t.Fatalf("Account = %q, want empty string", got.Account)
-	}
-	if _, ok := got.Labels["account"]; ok {
-		t.Fatalf("empty account should not appear in labels: %#v", got.Labels)
-	}
-	if got.Labels["environment"] != "prod" {
-		t.Fatalf("Labels[environment] = %q, want %q", got.Labels["environment"], "prod")
-	}
-}
-
-// ---------------------------------------------------------------------
-// computeContext — service scope
-// ---------------------------------------------------------------------
-
-func TestComputeContext_ServiceScope_FullCascade(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Init: contextInit{
-			Account:     strptr("acme"),
-			Environment: strptr("prod"),
-			Metadata: map[string]string{
-				"ecosystem": "production",
-				"platform":  "core",
-			},
-		},
-		Service: strptr("api"),
-		Metadata: map[string]string{
-			"version": "1.2.3",
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if got.Scope != "service" {
-		t.Fatalf("Scope = %q, want %q", got.Scope, "service")
-	}
-	if got.Account != "acme" || *got.Environment != "prod" || *got.Service != "api" {
-		t.Fatalf("got %q/%v/%v, want acme/prod/api", got.Account, got.Environment, got.Service)
-	}
-
-	wantLabels := map[string]string{
-		"account":     "acme",
-		"environment": "prod",
-		"service":     "api",
-		"scope":       "service",
-		"platform":    "core",
-		"ecosystem":   "production",
-		"terraform":   "true",
-		"env":         "prod",
-	}
-	if !reflect.DeepEqual(got.Labels, wantLabels) {
-		t.Fatalf("Labels = %#v, want %#v", got.Labels, wantLabels)
-	}
-	if got.Metadata["version"] != "1.2.3" {
-		t.Fatalf("Metadata[version] = %q, want %q", got.Metadata["version"], "1.2.3")
-	}
-	if _, ok := got.Labels["version"]; ok {
-		t.Fatalf("version must not leak into labels at service scope: %#v", got.Labels)
-	}
-}
-
-func TestComputeContext_ServiceScope_UserSuppliedScopeKeyIsOverridden(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Init:     contextInit{Account: strptr("acme"), Environment: strptr("prod"), Metadata: baseMetadata()},
-		Service:  strptr("api"),
-		Metadata: map[string]string{"scope": "bogus"},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Metadata["scope"] != "service" {
-		t.Fatalf("Metadata[scope] = %q, want %q", got.Metadata["scope"], "service")
-	}
-	if got.Labels["scope"] != "service" {
-		t.Fatalf("Labels[scope] = %q, want %q", got.Labels["scope"], "service")
-	}
-}
-
-func TestComputeContext_ServiceScope_EnvironmentFromDirectValue(t *testing.T) {
-	// environment doesn't have to come from init — a direct value works too.
-	got, err := computeContext(contextInput{
-		Account:     strptr("acme"),
-		Environment: strptr("prod"),
-		Service:     strptr("api"),
-		Metadata:    baseMetadata(),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Environment == nil || *got.Environment != "prod" {
-		t.Fatalf("Environment = %v, want prod", got.Environment)
-	}
-}
-
-func TestComputeContext_ServiceScope_EmptyServicePointerTreatedAsUnset(t *testing.T) {
-	// A non-nil pointer to "" for Service must behave as if Service were
-	// never set at all — so no environment-required error, and scope stays
-	// at whatever environment/account resolves to.
-	got, err := computeContext(contextInput{
-		Account:     strptr("acme"),
-		Environment: strptr("prod"),
-		Service:     strptr(""),
-		Metadata:    baseMetadata(),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Scope != "environment" {
-		t.Fatalf("Scope = %q, want %q (empty service should be treated as unset)", got.Scope, "environment")
-	}
-	if got.Service != nil {
-		t.Fatalf("Service = %v, want nil", got.Service)
-	}
-}
-
-// ---------------------------------------------------------------------
-// computeContext — cross-scope precedence
-// ---------------------------------------------------------------------
-
-func TestComputeContext_DirectValueOverridesInit(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Init: contextInit{
-			Account:  strptr("from-init"),
-			Metadata: map[string]string{"ecosystem": "production", "platform": "from-init"},
-		},
-		Account:  strptr("from-direct"),
-		Metadata: map[string]string{"platform": "from-direct"},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if got.Account != "from-direct" {
-		t.Fatalf("Account = %q, want direct value to win over init", got.Account)
-	}
-	if got.Labels["platform"] != "from-direct" {
-		t.Fatalf("Labels[platform] = %q, want direct metadata to win over init metadata", got.Labels["platform"])
-	}
-}
-
-func TestComputeContext_AccountNameCasingPreservedInAccountFieldButNotInLabels(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Account:  strptr("ACME"),
-		Metadata: baseMetadata(),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got.Account != "ACME" {
-		t.Fatalf("Account = %q, want %q (raw output must preserve case)", got.Account, "ACME")
-	}
-	if got.Labels["account"] != "acme" {
-		t.Fatalf("Labels[account] = %q, want %q (labels must be lowercased)", got.Labels["account"], "acme")
-	}
-}
-
-func TestComputeContext_LabelNormalization(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Account: strptr("acme"),
-		Metadata: map[string]string{
-			"ecosystem": "production",
-			"platform":  "some.dotted.value",
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if got.Labels["platform"] != "some-dotted-value" {
-		t.Fatalf("Labels[platform] = %q, want dots replaced with dashes", got.Labels["platform"])
-	}
-}
-
-// ---------------------------------------------------------------------
-// computeContext — errors
-// ---------------------------------------------------------------------
-
-func TestComputeContext_ServiceRequiresEnvironment(t *testing.T) {
-	// Mirrors the HCL module's implicit requirement: module.service reads
-	// module.environment[0], which doesn't exist unless environment is set —
-	// there, an unset environment surfaces as a confusing "index out of
-	// range" error deep in a submodule. Here it's a direct, named error.
-	_, err := computeContext(contextInput{
-		Account: strptr("acme"),
-		Service: strptr("api"),
-	})
-	if err == nil {
-		t.Fatal("expected an error when service is set without environment, got nil")
-	}
-}
-
-func TestComputeContext_ServiceRequiresEnvironment_ErrorNamesTheService(t *testing.T) {
-	_, err := computeContext(contextInput{
-		Account: strptr("acme"),
-		Service: strptr("api"),
-	})
-	if err == nil {
-		t.Fatal("expected an error, got nil")
-	}
-	if got := err.Error(); !strings.Contains(got, "api") || !strings.Contains(got, "environment") {
-		t.Fatalf("error %q should name the service and mention environment", got)
-	}
-}
-
-func TestComputeContext_ServiceFromInit_RequiresEnvironment(t *testing.T) {
-	// Service can be supplied via Init just as easily as directly — the
-	// environment requirement must still be enforced in that path.
-	_, err := computeContext(contextInput{
-		Account: strptr("acme"),
-		Init:    contextInit{Service: strptr("api")},
-	})
-	if err == nil {
-		t.Fatal("expected an error when service (via init) is set without environment, got nil")
-	}
-}
-
-func TestComputeContext_ServiceWithEmptyEnvironmentPointerStillErrors(t *testing.T) {
-	// Environment explicitly set to a pointer-to-empty-string is the same as
-	// unset, so this must still error.
-	_, err := computeContext(contextInput{
-		Account:     strptr("acme"),
-		Environment: strptr(""),
-		Service:     strptr("api"),
-	})
-	if err == nil {
-		t.Fatal("expected an error when environment resolves to unset (empty string), got nil")
-	}
-}
-
-func TestComputeContext_ErrorResultIsZeroValue(t *testing.T) {
-	got, err := computeContext(contextInput{
-		Account: strptr("acme"),
-		Service: strptr("api"),
-	})
-	if err == nil {
-		t.Fatal("expected an error, got nil")
-	}
-	if !reflect.DeepEqual(got, contextResult{}) {
-		t.Fatalf("result on error = %#v, want zero value", got)
+func TestComputeContext_Errors(t *testing.T) {
+	withAccount := func(extra ...string) map[string]*string {
+		return mergeMetadata(platformMetadata(), md(extra...))
+	}
+	tests := []struct {
+		name    string
+		in      contextInput
+		errPart string
+	}{
+		{"no platform", contextInput{Metadata: platformMetadata()}, "platform must be set"},
+		{"missing control_plane", contextInput{Platform: strptr("p"), Metadata: md("organization", "o", "status", "ACTIVE")}, `"control_plane" is required`},
+		{"status must be ACTIVE/INACTIVE", contextInput{Platform: strptr("p"), Metadata: md("organization", "o", "status", "active", "control_plane", "c")}, `"status" must be`},
+		{"null status", fromInit(contextInit{Platform: strptr("p"), Metadata: md("organization", "o", "status", nullv, "control_plane", "c")}), `"status" must not be null`},
+		{"environment without account", contextInput{Platform: strptr("p"), Environment: strptr("e"), Metadata: platformMetadata()}, "environment requires an account"},
+		{"empty environment still requires account", contextInput{Platform: strptr("p"), Environment: strptr(""), Metadata: platformMetadata()}, "environment requires an account"},
+		{"service without environment", contextInput{Platform: strptr("p"), Account: strptr("a"), Service: strptr("s"), Metadata: withAccount("ecosystem", "production")}, "service requires an environment"},
+		{"empty account under an environment", contextInput{Platform: strptr("p"), Account: strptr(""), Environment: strptr("e"), Metadata: platformMetadata()}, `environment "e" requires an account`},
+		{"missing ecosystem", contextInput{Platform: strptr("p"), Account: strptr("a"), Metadata: platformMetadata()}, `"ecosystem" is required`},
+		{"null ecosystem", fromInit(contextInit{Platform: strptr("p"), Account: strptr("a"), Metadata: withAccount("ecosystem", nullv)}), `"ecosystem" must not be null`},
+		{"invalid ecosystem", contextInput{Platform: strptr("p"), Account: strptr("a"), Metadata: withAccount("ecosystem", "staging")}, `"ecosystem" must be`},
+		{"invalid cloud", contextInput{Platform: strptr("p"), Account: strptr("a"), Metadata: withAccount("ecosystem", "production", "cloud", "azure")}, `"cloud" must be`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := computeContext(tt.in)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got result %#v", tt.errPart, got)
+			}
+			if !strings.Contains(err.Error(), tt.errPart) {
+				t.Fatalf("error = %q, want it to contain %q", err.Error(), tt.errPart)
+			}
+			if !reflect.DeepEqual(got, contextResult{}) {
+				t.Fatalf("error result must be the zero value, got %#v", got)
+			}
+		})
 	}
 }

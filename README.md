@@ -1,7 +1,7 @@
 # terraform-provider-moshlabs
 
 A custom Terraform provider that replaces two "pure computation, called everywhere" HCL modules —
-`system-context` (account/environment/service scoping) and `system-resource` (delimited resource
+`system-context` (platform/account/environment/service scoping) and `system-resource` (delimited resource
 naming) — with data sources. Both are straight ports of the original module logic — same
 coalesce/merge/filter semantics, same naming rules — computed once in Go and exposed as a single data
 source read, instead of a module call that fans out into more nested module calls. The originals live
@@ -15,14 +15,14 @@ terraform {
   required_providers {
     moshlabs = {
       source  = "moshlabsdotnet/moshlabs"
-      version = "~> 0.1"
+      version = "~> 1.0"
     }
   }
 }
 ```
 
 **Why:** these two modules are called at 100+ sites combined across the module tree, and neither is a
-cheap passthrough — `system-context` instantiates up to 3 more nested modules per call, and
+cheap passthrough — `system-context` instantiates up to 4 more nested modules per call, and
 `system-resource` adds another `system-context` call on top of that. At scale this measurably bloats
 `terraform plan`'s graph-construction time (specifically `TransitiveReductionTransformer`, which scales
 with vertex/edge count). Collapsing each cascade into one data source read removes those extra graph
@@ -48,25 +48,24 @@ Inputs mirror `system-context`'s variables:
 
 | Attribute | Type | Notes |
 |---|---|---|
-| `init` | object | The parent scope's already-resolved context (`account`, `environment`, `service`, `metadata`). Pass the previous level's data source attributes here instead of re-deriving them. `init.metadata` is `map(string)`. |
-| `account` / `environment` / `service` | string, optional+computed | A direct value here wins over the matching `init` field. `service` requires `environment` to be set somewhere in the chain. |
-| `metadata` | dynamic (any shape), optional+computed | Matches `system-context`'s permissive `any`-typed metadata argument — you can pass a rich object (e.g. a whole `var.config`) without curating it first. Only the keys relevant to the *resolved* scope are kept and merged with `init.metadata`; everything else is silently dropped, same as the original HCL's per-scope `object()` type coercion did. Allowed keys: account → `ecosystem` (required, must be `"production"` or `"development"`), `platform` (required), `cloud`, `region`; environment → adds `region`; service → adds `version`. The resolved value is always a flat string map. |
+| `init` | object | The parent scope's already-resolved context (`platform`, `account`, `environment`, `service`, `metadata`) — typically the whole parent data source (or `system-context` module output). `init.metadata` is `map(string)`. |
+| `platform` / `account` / `environment` / `service` | string, optional+computed | A direct value here wins over the matching `init` field (`""` counts as unset). `platform` is required somewhere in the chain; `environment` requires `account`; `service` requires `environment`. |
+| `metadata` | dynamic (any shape), optional+computed | Matches `system-context`'s permissive `any`-typed metadata argument — you can pass a rich object (e.g. a whole `var.config`) without curating it first. Merged over `init.metadata`, then only the keys each resolved scope declares are kept; everything else is silently dropped, same as the original HCL's per-scope `object()` type coercion. Declared keys: platform → `organization`, `status` (`"ACTIVE"`/`"INACTIVE"`), `control_plane`, all required; account → adds `ecosystem` (required, `"production"`/`"development"`), `cloud` (`"gcp"`/`"aws"`), `region`; environment → `region`; service → `version`. |
 
-Computed-only outputs: `scope` (`"account"`, `"environment"`, or `"service"` — whichever was resolved)
-and `labels` (the same cascading, filtered, lowercased/dash-normalized label map `system-context`
-builds today).
+Computed-only outputs: `scope` (`"platform"`, `"account"`, `"environment"`, or `"service"` — whichever
+was resolved) and `labels` (the same cascading, filtered, lowercased/dash-normalized label map
+`system-context` builds).
 
-**Known intentional deviation:** the original HCL's label filter at environment scope lists
-`environment_id` as an allowed label key, but that key can never actually survive — the environment
-submodule's own metadata type only allows `region` through, so anything else (including
-`environment_id`) is dropped upstream before the label filter ever sees it. That's a latent bug in the
-original module; this provider reproduces it exactly (verified empirically against the live
-`system-context` module) rather than silently fixing it, so behavior is identical for any code
-currently relying on it either way.
+**Nulls are preserved, not dropped.** Like the HCL module's output, resolved `metadata` contains every
+declared key for the resolved scope — unset optional ones as explicit nulls (`cloud = null`), so
+`context.metadata.cloud` indexes cleanly. A required key that is present-but-null (e.g.
+`control_plane = null` arriving via `init.metadata`) passes, exactly as it does in HCL; `status` and
+`ecosystem` still fail when null, since the HCL `contains()` validation rejects a null.
 
 See [internal/provider/context.go](internal/provider/context.go) for the full cascade logic and
-[internal/provider/context_test.go](internal/provider/context_test.go) for the behavior it's pinned to
-— label filtering per scope, metadata precedence, and normalization are all covered there.
+[internal/provider/context_test.go](internal/provider/context_test.go) for the behavior it's pinned to.
+The `computeContext` parity cases there were captured verbatim from `terraform apply` runs of
+`modules/system-context` itself, including the error and null/empty-string edge cases.
 
 ## `moshlabs_resource`
 

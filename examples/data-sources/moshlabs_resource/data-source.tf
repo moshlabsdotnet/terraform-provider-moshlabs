@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 data "moshlabs_context" "this" {
+  platform    = "core"
   account     = "acme"
   environment = "prod"
   service     = "api"
   metadata = {
-    ecosystem = "production"
-    platform  = "core"
+    organization  = "acme.com"
+    status        = "ACTIVE"
+    control_plane = "core"
+    ecosystem     = "production"
   }
 }
 

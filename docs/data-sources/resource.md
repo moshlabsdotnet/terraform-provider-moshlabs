@@ -13,13 +13,19 @@ Builds a consistently-delimited resource name from a context (account/environmen
 ## Example Usage
 
 ```terraform
+# Copyright 2026 Mosh Labs
+# SPDX-License-Identifier: Apache-2.0
+
 data "moshlabs_context" "this" {
+  platform    = "core"
   account     = "acme"
   environment = "prod"
   service     = "api"
   metadata = {
-    ecosystem = "production"
-    platform  = "core"
+    organization  = "acme.com"
+    status        = "ACTIVE"
+    control_plane = "core"
+    ecosystem     = "production"
   }
 }
 

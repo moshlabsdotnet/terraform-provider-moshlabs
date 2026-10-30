@@ -35,48 +35,33 @@ func TestStringMapFromTF_AllValuesPresent(t *testing.T) {
 		"ecosystem": types.StringValue("production"),
 		"platform":  types.StringValue("core"),
 	})
-	got := stringMapFromTF(m)
+	got := derefMap(stringMapFromTF(m))
 	want := map[string]string{"ecosystem": "production", "platform": "core"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
 }
 
-func TestStringMapFromTF_NullElementIsDroppedNotErrored(t *testing.T) {
-	// Regression test: state written by the old HCL system-context module
-	// can contain an explicit null for an unset optional(string) attribute
-	// (e.g. "region") — object() type constraints fill unset optional
-	// attributes with null rather than omitting the key. A real plan against
-	// suture-dev/k8s's account remote state hit exactly this: init.metadata
-	// came through with region = null and the old strict ElementsAs-based
-	// decode failed with "Received null value, however the target type
-	// cannot handle null values". The null element must be dropped, not
-	// error, since every downstream consumer already treats "absent" and
-	// "null" identically.
+func TestStringMapFromTF_NullElementIsKeptAsNil(t *testing.T) {
+	// State written by the HCL system-context module contains explicit
+	// nulls for unset optional(string) attributes (e.g. "region") — object()
+	// type constraints fill them with null rather than omitting the key. A
+	// strict ElementsAs-based decode fails on those ("Received null value,
+	// however the target type cannot handle null values"), so they must
+	// decode without error — and stay present, since a present-but-null
+	// required attribute (e.g. control_plane) passes the HCL type check
+	// where an absent one fails it.
 	m := types.MapValueMust(types.StringType, map[string]attr.Value{
 		"ecosystem": types.StringValue("production"),
 		"region":    types.StringNull(),
 	})
 	got := stringMapFromTF(m)
-	want := map[string]string{"ecosystem": "production"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %#v, want %#v (region should be dropped, not present as \"\" or cause an error)", got, want)
+	v, ok := got["region"]
+	if !ok || v != nil {
+		t.Fatalf("got %#v, want \"region\" present with a nil value", derefMap(got))
 	}
-	if _, ok := got["region"]; ok {
-		t.Fatalf("got %#v, want \"region\" key entirely absent", got)
-	}
-}
-
-func TestStringMapFromTF_AllNullYieldsEmptyMapNotNil(t *testing.T) {
-	m := types.MapValueMust(types.StringType, map[string]attr.Value{
-		"region": types.StringNull(),
-	})
-	got := stringMapFromTF(m)
-	if got == nil {
-		t.Fatal("got nil, want a non-nil empty map (the Map itself was known, just its only element was null)")
-	}
-	if len(got) != 0 {
-		t.Fatalf("got %#v, want empty", got)
+	if derefPtr(got["ecosystem"]) != "production" {
+		t.Fatalf("got %#v, want ecosystem=production", derefMap(got))
 	}
 }
 
@@ -111,7 +96,7 @@ func TestScalarsFromDynamic_ObjectWithScalarsOnly(t *testing.T) {
 		map[string]attr.Type{"ecosystem": types.StringType, "platform": types.StringType},
 		map[string]attr.Value{"ecosystem": types.StringValue("production"), "platform": types.StringValue("core")},
 	)
-	got := scalarsFromDynamic(types.DynamicValue(obj))
+	got := derefMap(scalarsFromDynamic(types.DynamicValue(obj)))
 	want := map[string]string{"ecosystem": "production", "platform": "core"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
@@ -137,27 +122,42 @@ func TestScalarsFromDynamic_NonScalarKeysAreDroppedNotErrored(t *testing.T) {
 			"variables": variables,
 		},
 	)
-	got := scalarsFromDynamic(types.DynamicValue(obj))
+	got := derefMap(scalarsFromDynamic(types.DynamicValue(obj)))
 	want := map[string]string{"version": "1.2.3", "replicas": "3"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v (variables must be dropped, not error)", got, want)
 	}
 }
 
-func TestScalarsFromDynamic_NullAttributeIsDropped(t *testing.T) {
+func TestScalarsFromDynamic_NullAttributeIsKeptAsNil(t *testing.T) {
+	// An explicit null overrides init.metadata in HCL merge(), so it must
+	// survive decoding rather than being dropped.
 	obj := types.ObjectValueMust(
 		map[string]attr.Type{"region": types.StringType},
 		map[string]attr.Value{"region": types.StringNull()},
 	)
 	got := scalarsFromDynamic(types.DynamicValue(obj))
-	if _, ok := got["region"]; ok {
-		t.Fatalf("got %#v, want \"region\" absent (null attribute)", got)
+	if v, ok := got["region"]; !ok || v != nil {
+		t.Fatalf("got %#v, want \"region\" present with a nil value", derefMap(got))
+	}
+}
+
+func TestScalarsFromDynamic_UntypedNullIsKeptAsNil(t *testing.T) {
+	// `metadata = { region = null }` — the literal null has no type, so the
+	// object attribute is a null Dynamic, not a null String.
+	obj := types.ObjectValueMust(
+		map[string]attr.Type{"region": types.DynamicType},
+		map[string]attr.Value{"region": types.DynamicNull()},
+	)
+	got := scalarsFromDynamic(types.DynamicValue(obj))
+	if v, ok := got["region"]; !ok || v != nil {
+		t.Fatalf("got %#v, want \"region\" present with a nil value", derefMap(got))
 	}
 }
 
 func TestScalarsFromDynamic_MapUnderlyingType(t *testing.T) {
 	m := types.MapValueMust(types.StringType, map[string]attr.Value{"region": types.StringValue("us-east1")})
-	got := scalarsFromDynamic(types.DynamicValue(m))
+	got := derefMap(scalarsFromDynamic(types.DynamicValue(m)))
 	want := map[string]string{"region": "us-east1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
@@ -169,7 +169,7 @@ func TestScalarsFromDynamic_BoolValue(t *testing.T) {
 		map[string]attr.Type{"enabled": types.BoolType},
 		map[string]attr.Value{"enabled": types.BoolValue(true)},
 	)
-	got := scalarsFromDynamic(types.DynamicValue(obj))
+	got := derefMap(scalarsFromDynamic(types.DynamicValue(obj)))
 	want := map[string]string{"enabled": "true"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
